@@ -1,11 +1,13 @@
+import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 class Settings(BaseSettings):
     app_name: str = "Grounded Entity Search"
     app_version: str = "0.1.0"
 
-    openai_api_key: str = "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"
+    openai_api_key: str = OPENAI_API_KEY
     openai_model: str = "gpt-4o-mini"
 
     search_api_key: str = "6df5cfc43645e55308529be5d6984d6fe92e46af94145226db8f9fc5e91a7777"
