@@ -2,22 +2,51 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from openai import OpenAI
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.entity_models import ExtractedCell, ExtractedEntity, ScrapedDocument
 from app.prompts.extraction_prompts import (
     build_extraction_system_prompt,
     build_extraction_user_prompt,
 )
 
+logger = get_logger(__name__)
+
+# GPT-4o-mini pricing (per token)
+_COST_INPUT = 0.15 / 1_000_000
+_COST_OUTPUT = 0.60 / 1_000_000
+
 
 class ExtractionService:
     def __init__(self) -> None:
         self.client = OpenAI(api_key=settings.openai_api_key)
         self.model = settings.openai_model
+        # Accumulated across all calls in one pipeline run — reset by orchestrator
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        # Hallucination tracking
+        self.evidence_total: int = 0
+        self.evidence_verified: int = 0
+
+    def reset_stats(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.evidence_total = 0
+        self.evidence_verified = 0
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        return round(
+            self.input_tokens * _COST_INPUT + self.output_tokens * _COST_OUTPUT, 5
+        )
+
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
 
     def extract_entities_from_document(
         self,
@@ -49,22 +78,28 @@ class ExtractionService:
         if not isinstance(raw_entities, list):
             return []
 
-        extracted_entities: List[ExtractedEntity] = []
-        print(f"[EXTRACT] url={document.url} parsed_entities={len(raw_entities) if isinstance(raw_entities, list) else 0}")
-
+        extracted: List[ExtractedEntity] = []
         for raw_entity in raw_entities:
-            normalized_entity = self._normalize_entity(
+            entity = self._normalize_entity(
                 raw_entity=raw_entity,
                 entity_type=entity_type,
                 schema_fields=schema_fields,
                 document_url=document.url,
+                document_text=document.text,
             )
-            if normalized_entity is not None:
-                extracted_entities.append(normalized_entity)
+            if entity is not None:
+                extracted.append(entity)
 
-        print(f"[EXTRACT] url={document.url} normalized_entities={len(extracted_entities)}")
+        logger.info(
+            "extract url=%s parsed=%d accepted=%d tokens_in=%d tokens_out=%d",
+            document.url, len(raw_entities), len(extracted),
+            self.input_tokens, self.output_tokens,
+        )
+        return extracted
 
-        return extracted_entities
+    # ------------------------------------------------------------------
+    # LLM call
+    # ------------------------------------------------------------------
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         response = self.client.chat.completions.create(
@@ -75,36 +110,39 @@ class ExtractionService:
                 {"role": "user", "content": user_prompt},
             ],
         )
+        if response.usage:
+            self.input_tokens += response.usage.prompt_tokens
+            self.output_tokens += response.usage.completion_tokens
+        return response.choices[0].message.content or ""
 
-        content = response.choices[0].message.content
-        return content or ""
+    # ------------------------------------------------------------------
+    # JSON parsing
+    # ------------------------------------------------------------------
 
     def _parse_json_response(self, raw_content: str) -> Dict[str, Any] | None:
         if not raw_content.strip():
             return None
-
         try:
             return json.loads(raw_content)
         except json.JSONDecodeError:
             pass
-
-        fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
-        if fenced_match:
+        fenced = re.search(r"```json\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
+        if fenced:
             try:
-                return json.loads(fenced_match.group(1))
+                return json.loads(fenced.group(1))
             except json.JSONDecodeError:
                 return None
-
-        first_brace = raw_content.find("{")
-        last_brace = raw_content.rfind("}")
-        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-            candidate = raw_content[first_brace : last_brace + 1]
+        first, last = raw_content.find("{"), raw_content.rfind("}")
+        if first != -1 and last != -1 and first < last:
             try:
-                return json.loads(candidate)
+                return json.loads(raw_content[first : last + 1])
             except json.JSONDecodeError:
-                return None
-
+                pass
         return None
+
+    # ------------------------------------------------------------------
+    # Normalisation
+    # ------------------------------------------------------------------
 
     def _normalize_entity(
         self,
@@ -112,6 +150,7 @@ class ExtractionService:
         entity_type: str,
         schema_fields: List[str],
         document_url: str,
+        document_text: str,
     ) -> ExtractedEntity | None:
         if not isinstance(raw_entity, dict):
             return None
@@ -120,10 +159,14 @@ class ExtractionService:
 
         for field_name in schema_fields:
             raw_field = raw_entity.get(field_name)
-
             if isinstance(raw_field, dict):
                 value = self._clean_value(field_name, raw_field.get("value"))
-                evidence = self._clean_evidence(raw_field.get("evidence"))
+                raw_evidence = self._clean_evidence(raw_field.get("evidence"))
+                evidence, verified = self._verify_evidence(raw_evidence, document_text)
+                if raw_evidence:
+                    self.evidence_total += 1
+                    if verified:
+                        self.evidence_verified += 1
             else:
                 value = None
                 evidence = None
@@ -138,127 +181,91 @@ class ExtractionService:
             return None
 
         name_cell = normalized_fields["name"]
-
-        entity_id = self._build_entity_id(name_cell.value)
-
         return ExtractedEntity(
-            entity_id=entity_id,
+            entity_id=self._build_entity_id(name_cell.value, entity_type),
             entity_type=entity_type,
             fields=normalized_fields,
             supporting_sources=[document_url],
             score=0.0,
         )
 
-    def _build_entity_id(self, name: str) -> str:
+    # ------------------------------------------------------------------
+    # Hallucination detection
+    # ------------------------------------------------------------------
+
+    def _verify_evidence(
+        self, evidence: str | None, document_text: str
+    ) -> Tuple[str | None, bool]:
+        """
+        Returns (evidence, is_verified).
+        Verified means the evidence string appears verbatim in the document
+        (case-insensitive, whitespace-normalised).
+        """
+        if not evidence:
+            return None, False
+
+        def _normalise(s: str) -> str:
+            return " ".join(s.lower().split())
+
+        norm_evidence = _normalise(evidence)
+        norm_doc = _normalise(document_text)
+
+        verified = norm_evidence in norm_doc
+        if not verified:
+            logger.debug("unverified_evidence snippet=%r", evidence[:80])
+
+        return evidence, verified
+
+    # ------------------------------------------------------------------
+    # Field cleaning
+    # ------------------------------------------------------------------
+
+    def _build_entity_id(self, name: str, entity_type: str = "") -> str:
         normalized = name.strip().lower()
-
-        # Remove noisy suffixes
-        noise_words = [
-            "community edition",
-            "community",
-            "ce",
-            "open source edition",
-            "edition",
-        ]
-
-        for word in noise_words:
-            normalized = normalized.replace(word, "")
-
+        if entity_type == "software_tool":
+            for phrase in ["community edition", "open source edition", "edition", r"\bcommunity\b"]:
+                normalized = re.sub(phrase, "", normalized)
         normalized = normalized.strip()
-
-        # Remove non-alphanumeric
         normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
-        normalized = normalized.strip("-")
-        return normalized or "unknown-entity"
+        return normalized.strip("-") or "unknown-entity"
 
     def _normalize_optional_string(self, value: Any) -> str | None:
-        if value is None:
+        if value is None or not isinstance(value, str):
             return None
-        if not isinstance(value, str):
-            return None
-
         cleaned = value.strip()
         return cleaned if cleaned else None
-    
+
     def _clean_value(self, field_name: str, value: Any) -> str | None:
         normalized = self._normalize_optional_string(value)
-        if normalized is None:
+        if normalized is None or normalized.lower() == "null":
             return None
-
-        if normalized.lower() == "null":
-            return None
-
         if field_name == "open_source_status":
             lowered = normalized.strip().lower()
-
-            if lowered in {
-                "open source",
-                "open-source",
-                "free open-source",
-                "free open source",
-                "opensource",
-                "open_source",
-                "true",
-                "yes",
-            }:
+            if lowered in {"open source", "open-source", "free open-source",
+                           "free open source", "opensource", "open_source", "true", "yes"}:
                 return "open_source"
-
-            if lowered in {
-                "not open source",
-                "closed source",
-                "closed-source",
-                "false",
-                "no",
-            }:
+            if lowered in {"not open source", "closed source", "closed-source", "false", "no"}:
                 return "not_open_source"
-
             return None
-
         return normalized
 
     def _clean_evidence(self, evidence: Any) -> str | None:
         normalized = self._normalize_optional_string(evidence)
-        if normalized is None:
+        if normalized is None or normalized.lower() == "null":
             return None
-
         lowered = normalized.lower()
-
-        if lowered == "null":
+        if lowered.startswith("document url:") or lowered.startswith("document title:"):
             return None
-
-        if lowered.startswith("document url:"):
-            return None
-
-        if lowered.startswith("document title:"):
-            return None
-
         return normalized
-    
-    def _is_meaningful_entity(
-        self,
-        normalized_fields: Dict[str, ExtractedCell],
-    ) -> bool:
+
+    def _is_meaningful_entity(self, normalized_fields: Dict[str, ExtractedCell]) -> bool:
         name_cell = normalized_fields.get("name")
         if not name_cell or not name_cell.value:
             return False
-
-        filled_non_name_fields = 0
-        for field_name, cell in normalized_fields.items():
-            if field_name == "name":
-                continue
-            if cell.value is not None:
-                filled_non_name_fields += 1
-
-        # Must have at least 2 meaningful fields
-        if filled_non_name_fields < 2:
+        if len(name_cell.value.split()) > 5:
             return False
-
-        # Must have at least one of these
-        if not (
-            normalized_fields.get("description").value
-            or normalized_fields.get("primary_use_case").value
-            or normalized_fields.get("website_or_repo").value
-        ):
-            return False
-
-        return True
+        filled_non_name = sum(
+            1 for f, c in normalized_fields.items()
+            if f != "name" and c.value is not None
+        )
+        return filled_non_name >= 2
