@@ -7,6 +7,12 @@ A system that takes a natural language topic query and returns a structured, sou
 
 > Note: The backend runs on Render's free tier and spins down after 15 minutes of inactivity. The first request after a period of inactivity may take ~50 seconds to respond while the server wakes up.
 
+### Landing Page
+![Landing Page](images/landing.jpeg)
+
+### Search Results
+![Search Results](images/search_results.jpeg)
+
 **Example queries:**
 - `"AI startups in healthcare"` → table of companies with name, website, description, category, location
 - `"top pizza places in Brooklyn"` → table of restaurants with name, neighborhood, cuisine, notable feature
