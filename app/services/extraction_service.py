@@ -151,6 +151,22 @@ class ExtractionService:
 
     def _build_entity_id(self, name: str) -> str:
         normalized = name.strip().lower()
+
+        # Remove noisy suffixes
+        noise_words = [
+            "community edition",
+            "community",
+            "ce",
+            "open source edition",
+            "edition",
+        ]
+
+        for word in noise_words:
+            normalized = normalized.replace(word, "")
+
+        normalized = normalized.strip()
+
+        # Remove non-alphanumeric
         normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
         normalized = normalized.strip("-")
         return normalized or "unknown-entity"
@@ -233,4 +249,16 @@ class ExtractionService:
             if cell.value is not None:
                 filled_non_name_fields += 1
 
-        return filled_non_name_fields >= 1
+        # Must have at least 2 meaningful fields
+        if filled_non_name_fields < 2:
+            return False
+
+        # Must have at least one of these
+        if not (
+            normalized_fields.get("description").value
+            or normalized_fields.get("primary_use_case").value
+            or normalized_fields.get("website_or_repo").value
+        ):
+            return False
+
+        return True

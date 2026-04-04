@@ -9,24 +9,31 @@ export default function PageLayout() {
 
   const handleSearch = async () => {
     if (!query.trim()) return;
-
+  
     setLoading(true);
     setError("");
     setHasSearched(true);
-
+  
     try {
-      const response = await fetch(
-        `http://localhost:8000/search?q=${encodeURIComponent(query)}`
-      );
-
+      const response = await fetch("http://localhost:8000/discover", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query }),
+      });
+  
       if (!response.ok) {
         throw new Error("Search request failed");
       }
-
+  
       const data = await response.json();
-
-      // Adjust this depending on backend response shape
+  
+      console.log("BACKEND RESPONSE:", data);
+  
+      // TEMP: since results are empty in your backend
       setResults(data.results || []);
+  
     } catch (err) {
       setError("Something went wrong while fetching results.");
       setResults([]);

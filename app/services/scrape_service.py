@@ -1,4 +1,5 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from typing import List, Optional
 
@@ -77,3 +78,41 @@ class ScrapeService:
             source_rank=source_rank,
             fetch_success=cleaned_text is not None,
         )
+    
+    
+
+    def scrape_search_results(self, search_results: List[SearchResult]) -> List[ScrapedDocument]:
+        scraped_documents: List[ScrapedDocument] = []
+
+        max_workers = min(5, len(search_results)) or 1
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_result = {
+                executor.submit(
+                    self.scrape_url,
+                    url=result.url,
+                    source_rank=result.rank,
+                    fallback_title=result.title,
+                ): result
+                for result in search_results
+            }
+
+            for future in as_completed(future_to_result):
+                try:
+                    document = future.result()
+                    scraped_documents.append(document)
+                except Exception:
+                    result = future_to_result[future]
+                    scraped_documents.append(
+                        ScrapedDocument(
+                            url=result.url,
+                            title=result.title,
+                            text=None,
+                            source_rank=result.rank,
+                            fetch_success=False,
+                        )
+                    )
+
+        # preserve original search rank order
+        scraped_documents.sort(key=lambda d: d.source_rank)
+        return scraped_documents
