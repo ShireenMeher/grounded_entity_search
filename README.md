@@ -1,6 +1,6 @@
 # Grounded — Agentic Entity Search
 
-A system that takes a natural language topic query and returns a structured, source-grounded table of discovered entities from the live web.
+An agentic entity search engine that takes a natural language topic query and returns a structured, source-grounded table of discovered entities from the live web. The system combines query classification, multi-query web retrieval, parallel scraping, LLM-based extraction, evidence verification, deduplication, multi-signal ranking, and per-query observability.
 
 **Live Demo:** [grounded-entity-search.vercel.app](https://grounded-entity-search.vercel.app)
 **API:** [grounded-api-6lin.onrender.com](https://grounded-api-6lin.onrender.com)
