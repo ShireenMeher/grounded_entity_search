@@ -134,6 +134,14 @@ Both scraping and LLM extraction run in `ThreadPoolExecutor` pools, which brough
 
 Net effect: typical end-to-end latency is now ~10–15s, with occasional spikes into the 20s when both a slow SerpAPI leg and a content-heavy page land in the same run.
 
+### Query result caching
+
+`DiscoveryOrchestrator.run()` checks an in-process TTL cache (`app/services/query_cache.py`) keyed on the normalised query text (lowercased, whitespace-collapsed) before doing any work. A cache hit returns the previous result with `metadata.served_from_cache: true` and skips every downstream stage — no LLM calls, no SerpAPI calls, no scraping. A fresh run stores its result before returning. In testing, a cold run took ~26s; the identical repeat query returned in ~14ms.
+
+**Why not always recompute?** The pipeline is expensive on every axis that matters — latency (10-20s), cost (3 SerpAPI searches + up to 4 LLM calls per query), and load on third-party sites being scraped. Identical queries are common in a search UI (a user re-running the same search, a demo repeating a canned example), and none of that cost buys anything the second time since the underlying web content hasn't meaningfully changed within the TTL window (1 hour by default).
+
+**Trade-offs, deliberately accepted:** the cache is in-process, so it's empty after a restart and isn't shared across workers if this were ever scaled beyond one Render dyno (same limitation as the metrics store — see Trade-offs). It's also keyed on exact (normalised) query text, not semantic similarity, so `"best pizza in Brooklyn"` and `"top pizza spots in Brooklyn"` are cache misses against each other despite likely returning similar results. Both are reasonable scope cuts for a single-instance deployment; a production version would want Redis for the former and embedding-similarity lookup for the latter.
+
 ### Monitoring and observability
 
 Every pipeline run records:
@@ -160,11 +168,11 @@ Structured logging uses Python's `logging` module with consistent format `%(asct
 | Multi-query SerpAPI cost | 3 SerpAPI searches per query instead of 1. At ~$0.001/search this triples the search cost to ~$0.003 per query. They run sequentially (not in parallel) to avoid per-key concurrency throttling — see Design Decisions. |
 | Per-document entity cap | Extraction is capped at 6 entities per document to bound LLM output latency. A page listing more than 6 relevant entities will have the rest dropped from that document, though deduplication across 3 documents usually still surfaces most of them. |
 | Schema variability | Dynamic schema means field names vary by query. The aggregation scoring handles any field names, but the frontend renders whatever columns come back. A query returning unusual field names will display correctly but may look sparse. |
-| No persistent cache | Repeated identical queries re-run the full pipeline. An in-memory or Redis cache keyed by query string would make re-fetches instant and free. |
+| Query cache is in-process only | Identical repeated queries are now served from an in-memory TTL cache (see Design Decisions) instead of re-running the full pipeline, but the cache lives in one process — it's empty after a restart and wouldn't be shared across multiple Render workers. Redis would be the fix for a real multi-instance deployment. |
 | Evidence verification is strict | Hallucination detection uses exact substring matching after whitespace normalisation. Some evidence that is paraphrased rather than copied verbatim (even if accurate) will be marked unverified. This is a conservative measure — false positives are preferable to false negatives for a grounding system. |
 | Deduplication is name-based | Two entities with slightly different names (e.g. `"Viz.ai"` vs `"Viz AI"`) won't merge. Fuzzy matching (edit distance or embedding similarity) would improve recall at the cost of precision. |
 | Metrics are prototype-scale | The 200-record in-memory ring buffer is observability for one instance during development, not production metrics infrastructure — it resets on every restart and isn't shared across workers if this were ever scaled beyond a single Render dyno. A real deployment would need persistent, aggregatable metrics (e.g. Prometheus/Grafana or a hosted APM). |
-| Test coverage is unit-level only | See Testing below — the pure business logic (aggregation, extraction parsing, classification) has unit tests, but there's no integration/e2e coverage of the full pipeline and no CI running the suite automatically. |
+| No end-to-end test coverage | See Testing below — unit tests cover the pure business logic and an integration suite mocks each service to test how the orchestrator composes them, but nothing exercises the real OpenAI/SerpAPI/scraping stack end-to-end, and there's no CI running the suite automatically on push. |
 
 ---
 
@@ -220,9 +228,9 @@ pip install -r requirements.txt
 pytest
 ```
 
-57 unit tests cover the pure business logic that doesn't require network access: `aggregation_service` (dedup key normalisation, group merging, scoring signals like official-site detection and single-source penalty), `extraction_service` (JSON response parsing across raw/fenced/embedded shapes, field/evidence cleaning, hallucination verification, entity-ID slugification, meaningfulness gating), `query_service` (LLM-response validation and the keyword-fallback classifier), and `search_service` (SerpAPI result parsing, plus the empty-results retry fallback described in Design Decisions). A `conftest.py` seeds dummy API keys so the suite never touches a real key or makes a network call.
+68 unit and integration tests. Unit tests cover the pure business logic that doesn't require network access: `aggregation_service` (dedup key normalisation, group merging, scoring signals like official-site detection and single-source penalty), `extraction_service` (JSON response parsing across raw/fenced/embedded shapes, field/evidence cleaning, hallucination verification, entity-ID slugification, meaningfulness gating), `query_service` (LLM-response validation and the keyword-fallback classifier), `search_service` (SerpAPI result parsing, plus the empty-results retry fallback described in Design Decisions), and `query_cache` (TTL expiry, LRU-style eviction, key normalisation). `test_discovery_orchestrator.py` adds integration-style tests: mocking each service's public entry point on `DiscoveryOrchestrator` and asserting on `run()`'s output shape — that stages compose correctly (merged entities dedup, metadata counts add up), that a query with no relevant pages degrades to an empty result instead of erroring, and that a repeated query is served from cache without re-invoking any downstream service. A `conftest.py` seeds dummy API keys so the suite never touches a real key or makes a network call.
 
-**What isn't covered, honestly:** there are no integration or end-to-end tests — every pipeline run in this README's benchmarks was validated manually (start the server, `curl /discover`, read the structured logs). There's also no test for the orchestrator's concurrency behavior (the `ThreadPoolExecutor` usage in search/scrape/extract), no load or scale testing beyond single manual queries, and no CI configured to run the suite automatically on push. If asked what to add next: an integration test that mocks the OpenAI/SerpAPI clients and asserts on `DiscoveryOrchestrator.run()`'s output shape would be the highest-value addition, since it's the one thing today's unit tests can't catch — a regression in how the stages compose.
+**What isn't covered, honestly:** there's no end-to-end test against the real OpenAI/SerpAPI/scraping stack — every pipeline run in this README's benchmarks was validated manually (start the server, `curl /discover`, read the structured logs). There's also no load or scale testing beyond single manual queries, and no CI configured to run the suite automatically on push.
 
 ---
 
@@ -296,7 +304,8 @@ pytest
       "scrape": 1.05,
       "extract": 7.57,
       "aggregate": 0.00
-    }
+    },
+    "served_from_cache": false
   },
   "execution_time_seconds": 9.91
 }
@@ -358,7 +367,8 @@ grounded_entity_search/
 │       ├── extraction_service.py      # GPT-4o-mini extraction + hallucination detection
 │       ├── aggregation_service.py     # Dedup + merge + multi-signal scoring
 │       ├── discovery_orchestrator.py  # Pipeline coordinator + snippet pre-ranker
-│       └── metrics_store.py           # In-memory metrics ring buffer
+│       ├── metrics_store.py           # In-memory metrics ring buffer
+│       └── query_cache.py             # In-process TTL cache for repeat /discover queries
 ├── frontend/
 │   └── src/
 │       └── components/layout/
@@ -366,9 +376,11 @@ grounded_entity_search/
 ├── tests/
 │   ├── conftest.py                    # Seeds dummy API keys so tests need no real secrets
 │   ├── test_aggregation_service.py    # Dedup, merging, multi-signal scoring
+│   ├── test_discovery_orchestrator.py # Integration: stage composition + cache behavior
 │   ├── test_extraction_service.py     # JSON parsing, field cleaning, hallucination checks
+│   ├── test_query_cache.py            # TTL expiry, LRU eviction, key normalisation
 │   ├── test_query_service.py          # Classification validation + keyword fallback
-│   └── test_search_service.py         # SerpAPI result parsing
+│   └── test_search_service.py         # SerpAPI result parsing + empty-result retry
 ├── requirements.txt
 └── README.md
 ```

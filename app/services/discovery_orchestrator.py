@@ -8,6 +8,7 @@ from app.core.logging import get_logger
 from app.services.aggregation_service import AggregationService
 from app.services.extraction_service import ExtractionService
 from app.services.metrics_store import QueryMetrics, metrics_store
+from app.services.query_cache import query_cache
 from app.services.query_service import QueryService
 from app.services.scrape_service import ScrapeService
 from app.services.search_service import SearchService
@@ -24,6 +25,14 @@ class DiscoveryOrchestrator:
         self.aggregation_service = AggregationService()
 
     def run(self, query: str):
+        cached = query_cache.get(query)
+        if cached is not None:
+            interpretation, final_entities, cached_metadata = cached
+            metadata = dict(cached_metadata)
+            metadata["served_from_cache"] = True
+            logger.info("cache_hit query=%r", query)
+            return interpretation, final_entities, metadata
+
         wall_start = time.perf_counter()
         stage_timings: dict[str, float] = {}
 
@@ -152,7 +161,9 @@ class DiscoveryOrchestrator:
             "evidence_total": self.extraction_service.evidence_total,
             "estimated_cost_usd": self.extraction_service.estimated_cost_usd,
             "stage_timings": stage_timings,
+            "served_from_cache": False,
         }
+        query_cache.set(query, (interpretation, final_entities, metadata))
         return interpretation, final_entities, metadata
 
     # ------------------------------------------------------------------
