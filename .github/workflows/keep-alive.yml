@@ -1,0 +1,14 @@
+name: Keep Render backend warm
+
+on:
+  schedule:
+    # Runs every 10 minutes
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # lets you also trigger it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend
+        run: curl -sSf https://grounded-api-6lin.onrender.com/ || echo "Ping failed (backend may still be waking up)"
