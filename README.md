@@ -161,6 +161,8 @@ Structured logging uses Python's `logging` module with consistent format `%(asct
 | No persistent cache | Repeated identical queries re-run the full pipeline. An in-memory or Redis cache keyed by query string would make re-fetches instant and free. |
 | Evidence verification is strict | Hallucination detection uses exact substring matching after whitespace normalisation. Some evidence that is paraphrased rather than copied verbatim (even if accurate) will be marked unverified. This is a conservative measure — false positives are preferable to false negatives for a grounding system. |
 | Deduplication is name-based | Two entities with slightly different names (e.g. `"Viz.ai"` vs `"Viz AI"`) won't merge. Fuzzy matching (edit distance or embedding similarity) would improve recall at the cost of precision. |
+| Metrics are prototype-scale | The 200-record in-memory ring buffer is observability for one instance during development, not production metrics infrastructure — it resets on every restart and isn't shared across workers if this were ever scaled beyond a single Render dyno. A real deployment would need persistent, aggregatable metrics (e.g. Prometheus/Grafana or a hosted APM). |
+| Test coverage is unit-level only | See Testing below — the pure business logic (aggregation, extraction parsing, classification) has unit tests, but there's no integration/e2e coverage of the full pipeline and no CI running the suite automatically. |
 
 ---
 
@@ -205,6 +207,20 @@ npm run dev
 ```
 
 Frontend runs at `http://localhost:5173`.
+
+---
+
+## Testing
+
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+pytest
+```
+
+55 unit tests cover the pure business logic that doesn't require network access: `aggregation_service` (dedup key normalisation, group merging, scoring signals like official-site detection and single-source penalty), `extraction_service` (JSON response parsing across raw/fenced/embedded shapes, field/evidence cleaning, hallucination verification, entity-ID slugification, meaningfulness gating), `query_service` (LLM-response validation and the keyword-fallback classifier), and `search_service` (SerpAPI result parsing). A `conftest.py` seeds dummy API keys so the suite never touches a real key or makes a network call.
+
+**What isn't covered, honestly:** there are no integration or end-to-end tests — every pipeline run in this README's benchmarks was validated manually (start the server, `curl /discover`, read the structured logs). There's also no test for the orchestrator's concurrency behavior (the `ThreadPoolExecutor` usage in search/scrape/extract), no load or scale testing beyond single manual queries, and no CI configured to run the suite automatically on push. If asked what to add next: an integration test that mocks the OpenAI/SerpAPI clients and asserts on `DiscoveryOrchestrator.run()`'s output shape would be the highest-value addition, since it's the one thing today's unit tests can't catch — a regression in how the stages compose.
 
 ---
 
@@ -345,6 +361,12 @@ grounded_entity_search/
 │   └── src/
 │       └── components/layout/
 │           └── PageLayout.jsx         # Full UI: search, table, evidence tooltips
+├── tests/
+│   ├── conftest.py                    # Seeds dummy API keys so tests need no real secrets
+│   ├── test_aggregation_service.py    # Dedup, merging, multi-signal scoring
+│   ├── test_extraction_service.py     # JSON parsing, field cleaning, hallucination checks
+│   ├── test_query_service.py          # Classification validation + keyword fallback
+│   └── test_search_service.py         # SerpAPI result parsing
 ├── requirements.txt
 └── README.md
 ```
