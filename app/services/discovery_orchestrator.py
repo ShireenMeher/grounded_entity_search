@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.aggregation_service import AggregationService
 from app.services.extraction_service import ExtractionService
@@ -26,23 +27,27 @@ class DiscoveryOrchestrator:
         wall_start = time.perf_counter()
         stage_timings: dict[str, float] = {}
 
-        # ── 1. Interpret query ─────────────────────────────────────────
-        interpretation = self.query_service.interpret_query(query)
+        # ── 1+2. Interpret query & multi-query retrieval ───────────────
+        # Independent LLM/network calls — run concurrently instead of
+        # paying for interpretation latency before search even starts.
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            interpretation_future = pool.submit(self.query_service.interpret_query, query)
+            search_future = pool.submit(self.search_service.search_multi, query)
+            interpretation = interpretation_future.result()
+            search_results = search_future.result()
+        stage_timings["search"] = round(time.perf_counter() - t0, 2)
         logger.info(
             "query_interpreted query=%r entity_type=%s fields=%s",
             query, interpretation.entity_type, interpretation.schema_fields,
         )
-
-        # ── 2. Multi-query retrieval ───────────────────────────────────
-        t0 = time.perf_counter()
-        search_results = self.search_service.search_multi(query)
-        stage_timings["search"] = round(time.perf_counter() - t0, 2)
         logger.info("search_done results=%d time=%.2fs", len(search_results), stage_timings["search"])
 
-        # ── 3. Pre-rank by snippet relevance ──────────────────────────
+        # ── 3. Pre-rank by snippet relevance, then cap candidates ──────
         search_results = self._rank_by_snippet_relevance(
             search_results, query, interpretation.entity_type
         )
+        search_results = search_results[: settings.max_scrape_candidates]
         logger.info("snippet_reranked top_url=%s", search_results[0].url if search_results else "none")
 
         # ── 4. Scrape ──────────────────────────────────────────────────

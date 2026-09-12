@@ -105,6 +105,9 @@ class ExtractionService:
         response = self.client.chat.completions.create(
             model=self.model,
             temperature=0,
+            # Bounds worst-case latency for pages with very long entity
+            # lists; comfortably fits the <=6-entities-per-doc prompt rule.
+            max_tokens=1800,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

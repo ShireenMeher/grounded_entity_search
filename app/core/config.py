@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     max_search_results: int = 5
     request_timeout_seconds: int = 15
 
+    # SerpAPI normally responds in under 1s (sequential calls; concurrent
+    # calls on this plan get severely throttled — see search_service.py).
+    # Kept tight so an occasional hung request doesn't dominate the stage.
+    search_timeout_seconds: int = 3
+
+    # Scraping is bounded separately: arbitrary third-party pages can hang,
+    # and we only need the first few good ones for extraction.
+    scrape_timeout_seconds: int = 8
+    max_scrape_candidates: int = 8
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

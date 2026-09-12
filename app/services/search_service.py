@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, List
 
 import requests
@@ -21,7 +20,7 @@ class SearchService:
     def __init__(self) -> None:
         self.provider = settings.search_provider.lower().strip()
         self.api_key = settings.search_api_key
-        self.timeout = settings.request_timeout_seconds
+        self.timeout = settings.search_timeout_seconds
         self.max_results = settings.max_search_results
         self._llm = OpenAI(api_key=settings.openai_api_key)
 
@@ -48,20 +47,21 @@ class SearchService:
         low_trust: List[SearchResult] = []
         rank_counter = 1
 
-        with ThreadPoolExecutor(max_workers=len(variants)) as pool:
-            futures = {pool.submit(self._search_serpapi, v): v for v in variants}
-            for future in as_completed(futures):
-                for result in future.result():
-                    if result.url in seen_urls:
-                        continue
-                    seen_urls.add(result.url)
-                    result = result.model_copy(update={"rank": rank_counter})
-                    rank_counter += 1
-                    domain = result.url.split("/")[2] if "//" in result.url else ""
-                    if any(d in domain for d in _LOW_TRUST_DOMAINS):
-                        low_trust.append(result)
-                    else:
-                        high_trust.append(result)
+        # SerpAPI on this plan/key severely throttles concurrent requests
+        # (a single call is ~0.1-3s; firing 3 at once has been observed to
+        # queue up to 25-55s). Sequential calls are faster in practice.
+        for variant in variants:
+            for result in self._search_serpapi(variant):
+                if result.url in seen_urls:
+                    continue
+                seen_urls.add(result.url)
+                result = result.model_copy(update={"rank": rank_counter})
+                rank_counter += 1
+                domain = result.url.split("/")[2] if "//" in result.url else ""
+                if any(d in domain for d in _LOW_TRUST_DOMAINS):
+                    low_trust.append(result)
+                else:
+                    high_trust.append(result)
 
         merged = high_trust + low_trust
         logger.info(

@@ -82,13 +82,16 @@ Extract entities relevant to the user query from this document only.
 Strict rules:
 1. Only extract entities explicitly mentioned in the document text.
 2. Only extract entities relevant to the user query.
+2b. Extract at most 6 entities. If the document lists more than 6, choose
+    the 6 most prominent and relevant to the query.
 3. Include all schema fields for every entity.
 4. If a field is not explicitly supported by the document text, return:
    {{
      "value": null,
      "evidence": null
    }}
-5. Evidence must be a short exact snippet copied from the document text.
+5. Evidence must be a short exact snippet copied from the document text
+   (ideally under 15 words — just enough to support the value).
 6. Never use:
    - "Document URL: ..."
    - "Document title: ..."

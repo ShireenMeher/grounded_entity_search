@@ -12,21 +12,8 @@ from app.models.entity_models import ScrapedDocument, SearchResult
 
 class ScrapeService:
     def __init__(self) -> None:
-        self.timeout = settings.request_timeout_seconds
+        self.timeout = settings.scrape_timeout_seconds
         self.max_text_chars = 15000
-
-    def scrape_search_results(self, search_results: List[SearchResult]) -> List[ScrapedDocument]:
-        scraped_documents: List[ScrapedDocument] = []
-
-        for result in search_results:
-            document = self.scrape_url(
-                url=result.url,
-                source_rank=result.rank,
-                fallback_title=result.title,
-            )
-            scraped_documents.append(document)
-
-        return scraped_documents
 
     def scrape_url(
         self,
@@ -84,7 +71,7 @@ class ScrapeService:
     def scrape_search_results(self, search_results: List[SearchResult]) -> List[ScrapedDocument]:
         scraped_documents: List[ScrapedDocument] = []
 
-        max_workers = min(5, len(search_results)) or 1
+        max_workers = min(10, len(search_results)) or 1
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_result = {
