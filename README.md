@@ -121,7 +121,7 @@ Entities are ranked by a composite score across 8 signals:
 
 **Evidence quality** is a new signal that separates entities with long, specific evidence from those with short or missing evidence. It combines: average evidence length (capped at +2.0), evidence coverage across fields (+1.0), and a per-field penalty for evidence shorter than 15 characters (−0.3 each).
 
-### Latency: 140s → 30–40s → 10–20s
+### Latency: 140s → 30–40s → 10–15s
 
 Both scraping and LLM extraction run in `ThreadPoolExecutor` pools, which brought end-to-end latency from ~140s (original sequential implementation) down to ~30–40s. A second pass of profiling on the 30–40s version found the remaining time wasn't where it looked:
 
@@ -130,7 +130,7 @@ Both scraping and LLM extraction run in `ThreadPoolExecutor` pools, which brough
 - **The 3 SerpAPI calls were parallelized**, which turned out to be actively counterproductive on this plan/key — see the concurrency note under Multi-query retrieval above.
 - **Extraction latency was dominated by output length**, not input length: a single content-rich list page could generate 3,000–4,600 output tokens (~20–38s on its own) because the model would extract every entity it found. Extraction is now capped to the 6 most relevant entities per document with a `max_tokens` safety bound, since downstream deduplication across 3 documents already gives enough coverage without needing every entity from every page.
 
-Net effect: typical end-to-end latency is now ~10–20s, with occasional spikes into the low 20s when both a slow SerpAPI leg and a content-heavy page land in the same run.
+Net effect: typical end-to-end latency is now ~10–15s, with occasional spikes into the 20s when both a slow SerpAPI leg and a content-heavy page land in the same run.
 
 ### Monitoring and observability
 
