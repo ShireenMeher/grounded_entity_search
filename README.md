@@ -31,13 +31,13 @@ User Query
 QueryService          ── LLM classifies entity type + generates schema fields
     │
     ▼
-SearchService         ── LLM generates 3 query variants → parallel SerpAPI calls → merge + dedup by URL
+SearchService         ── LLM generates 3 query variants → sequential SerpAPI calls → merge + dedup by URL
     │
     ▼
 Snippet Pre-Ranker    ── Scores search results by query term overlap + entity-type keywords + snippet length
-    │                    Reorders before scraping so best candidates are scraped first
+    │                    Reorders before scraping and caps the pool to the top 8 candidates
     ▼
-ScrapeService         ── Parallel HTTP fetch + trafilatura text extraction (ThreadPoolExecutor)
+ScrapeService         ── Parallel HTTP fetch (top-8 candidates only) + trafilatura text extraction (ThreadPoolExecutor)
     │                    Filters to pages relevant to entity type
     ▼
 ExtractionService     ── Parallel GPT-4o-mini calls per page (dynamic schema + dynamic JSON shape)
@@ -70,9 +70,11 @@ A keyword-matching fallback activates if the LLM call fails, ensuring the pipeli
 
 ### Multi-query retrieval
 
-Rather than issuing a single search, the system uses GPT-4o-mini to generate 3 query variants (e.g. `"best tacos in LA"` → `"most popular taqueria Los Angeles"` + `"top-rated taco spots LA 2024"`). All variants run in parallel against SerpAPI, results are merged and deduplicated by URL, and low-quality domains (Reddit, Quora, Pinterest) are deprioritised.
+Rather than issuing a single search, the system uses GPT-4o-mini to generate 3 query variants (e.g. `"best tacos in LA"` → `"most popular taqueria Los Angeles"` + `"top-rated taco spots LA 2024"`). Results are merged and deduplicated by URL, and low-quality domains (Reddit, Quora, Pinterest) are deprioritised.
 
 **Why?** A single query returns a biased sample of the web. Variants surface different curated lists and authoritative sources that a single phrasing misses.
+
+**Why are the SerpAPI calls sequential, not parallel?** They used to fire all 3 variants concurrently via a `ThreadPoolExecutor`, which looks like the obvious win. In practice, this SerpAPI plan/key throttles concurrent requests hard — profiling showed one request finishing in 0.17s while its two concurrent siblings queued for 26s and 55s. Issued back-to-back instead, all 3 typically finish in under 2s combined. Concurrency isn't free when the bottleneck is server-side rate limiting rather than client-side wait time.
 
 ### Snippet-based pre-ranking before scraping
 
@@ -119,9 +121,16 @@ Entities are ranked by a composite score across 8 signals:
 
 **Evidence quality** is a new signal that separates entities with long, specific evidence from those with short or missing evidence. It combines: average evidence length (capped at +2.0), evidence coverage across fields (+1.0), and a per-field penalty for evidence shorter than 15 characters (−0.3 each).
 
-### Parallel scraping and extraction
+### Latency: 140s → 30–40s → 10–20s
 
-Both scraping and LLM extraction run in `ThreadPoolExecutor` pools. This brings end-to-end latency from ~140s (original sequential implementation) to ~30–40s.
+Both scraping and LLM extraction run in `ThreadPoolExecutor` pools, which brought end-to-end latency from ~140s (original sequential implementation) down to ~30–40s. A second pass of profiling on the 30–40s version found the remaining time wasn't where it looked:
+
+- **Query interpretation and search ran back-to-back** even though neither depends on the other's output. They now run concurrently, hiding one full LLM round-trip.
+- **Every merged search result was scraped** (up to ~15 URLs after dedup across 3 query variants), even though only the top 3 relevant pages are ever used for extraction. Scraping is now capped to the top 8 candidates after snippet-reranking, with concurrency and per-request timeouts sized to match.
+- **The 3 SerpAPI calls were parallelized**, which turned out to be actively counterproductive on this plan/key — see the concurrency note under Multi-query retrieval above.
+- **Extraction latency was dominated by output length**, not input length: a single content-rich list page could generate 3,000–4,600 output tokens (~20–38s on its own) because the model would extract every entity it found. Extraction is now capped to the 6 most relevant entities per document with a `max_tokens` safety bound, since downstream deduplication across 3 documents already gives enough coverage without needing every entity from every page.
+
+Net effect: typical end-to-end latency is now ~10–20s, with occasional spikes into the low 20s when both a slow SerpAPI leg and a content-heavy page land in the same run.
 
 ### Monitoring and observability
 
@@ -145,8 +154,9 @@ Structured logging uses Python's `logging` module with consistent format `%(asct
 |---|---|
 | Single-depth crawling | The system scrapes the pages returned by search but never follows links to entity homepages. Company `website` and `location` fields are often null because list articles don't embed direct URLs inline. A second-pass crawl (fetch entity's own site after finding its name) would fix this. |
 | JavaScript rendering | Pages built with React/Next.js return near-empty HTML to `requests`. Affected pages silently produce `fetch_success=False`. A Playwright fallback for pages returning <300 chars of text would cover this. |
-| LLM classification cost | Each query now makes 2 LLM calls before any scraping (classification + query expansion). At GPT-4o-mini pricing this adds ~$0.001 per query but increases latency by 1–2s. |
-| Multi-query SerpAPI cost | 3 parallel SerpAPI searches per query instead of 1. At ~$0.001/search this triples the search cost to ~$0.003 per query. |
+| LLM classification cost | Each query makes 2 LLM calls before any scraping (classification + query expansion). At GPT-4o-mini pricing this adds ~$0.001 per query; classification runs concurrently with search so it adds little to latency. |
+| Multi-query SerpAPI cost | 3 SerpAPI searches per query instead of 1. At ~$0.001/search this triples the search cost to ~$0.003 per query. They run sequentially (not in parallel) to avoid per-key concurrency throttling — see Design Decisions. |
+| Per-document entity cap | Extraction is capped at 6 entities per document to bound LLM output latency. A page listing more than 6 relevant entities will have the rest dropped from that document, though deduplication across 3 documents usually still surfaces most of them. |
 | Schema variability | Dynamic schema means field names vary by query. The aggregation scoring handles any field names, but the frontend renders whatever columns come back. A query returning unusual field names will display correctly but may look sparse. |
 | No persistent cache | Repeated identical queries re-run the full pipeline. An in-memory or Redis cache keyed by query string would make re-fetches instant and free. |
 | Evidence verification is strict | Hallucination detection uses exact substring matching after whitespace normalisation. Some evidence that is paraphrased rather than copied verbatim (even if accurate) will be marked unverified. This is a conservative measure — false positives are preferable to false negatives for a grounding system. |
@@ -254,23 +264,23 @@ Frontend runs at `http://localhost:5173`.
     }
   ],
   "metadata": {
-    "search_results_considered": 15,
-    "pages_scraped": 12,
-    "pages_failed": 3,
-    "entities_extracted_before_dedup": 24,
-    "entities_after_dedup": 16,
+    "search_results_considered": 21,
+    "pages_scraped": 7,
+    "pages_failed": 1,
+    "entities_extracted_before_dedup": 14,
+    "entities_after_dedup": 11,
     "hallucination_rate": 0.03,
     "evidence_verified": 58,
     "evidence_total": 60,
-    "estimated_cost_usd": 0.0031,
+    "estimated_cost_usd": 0.0029,
     "stage_timings": {
-      "search": 2.1,
-      "scrape": 9.4,
-      "extract": 18.2,
-      "aggregate": 0.04
+      "search": 1.29,
+      "scrape": 1.05,
+      "extract": 7.57,
+      "aggregate": 0.00
     }
   },
-  "execution_time_seconds": 31.4
+  "execution_time_seconds": 9.91
 }
 ```
 
@@ -279,26 +289,26 @@ Frontend runs at `http://localhost:5173`.
 ```json
 {
   "total_queries": 12,
-  "avg_latency_s": 33.2,
-  "avg_entities_returned": 14.6,
+  "avg_latency_s": 14.8,
+  "avg_entities_returned": 13.1,
   "avg_hallucination_rate": 0.031,
   "avg_scrape_failure_rate": 0.18,
-  "total_estimated_cost_usd": 0.038,
-  "avg_cost_per_query_usd": 0.0032,
+  "total_estimated_cost_usd": 0.032,
+  "avg_cost_per_query_usd": 0.0027,
   "avg_stage_timings": {
-    "search": 2.3,
-    "scrape": 10.1,
-    "extract": 19.4,
-    "aggregate": 0.05
+    "search": 3.1,
+    "scrape": 1.1,
+    "extract": 8.6,
+    "aggregate": 0.01
   },
   "recent": [
     {
       "query": "top pizza places in Brooklyn",
       "entity_type": "restaurant",
-      "entities": 21,
-      "hallucination_rate": 0.02,
-      "cost_usd": 0.0027,
-      "time_s": 29.1
+      "entities": 18,
+      "hallucination_rate": 0.14,
+      "cost_usd": 0.0029,
+      "time_s": 13.04
     }
   ]
 }
