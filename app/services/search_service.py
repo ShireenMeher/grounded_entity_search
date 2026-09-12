@@ -64,6 +64,16 @@ class SearchService:
                     high_trust.append(result)
 
         merged = high_trust + low_trust
+
+        if not merged:
+            # Every variant call failed (e.g. transient SerpAPI/network
+            # slowness tripping search_timeout_seconds). Rather than
+            # returning nothing, retry the original query once with a
+            # more generous timeout — this only adds latency to the
+            # already-failing case, not the common path.
+            logger.warning("search_multi_empty_retrying query=%r", query)
+            merged = self._search_serpapi(query, timeout=self.timeout * 3)
+
         logger.info(
             "search_multi query=%r variants=%d total_results=%d",
             query, len(variants), len(merged),
@@ -114,7 +124,7 @@ class SearchService:
     # SerpAPI
     # ------------------------------------------------------------------
 
-    def _search_serpapi(self, query: str) -> List[SearchResult]:
+    def _search_serpapi(self, query: str, timeout: int | None = None) -> List[SearchResult]:
         if not self.api_key:
             logger.warning("search_api_key not set — skipping search")
             return []
@@ -128,7 +138,7 @@ class SearchService:
                     "api_key": self.api_key,
                     "num": self.max_results,
                 },
-                timeout=self.timeout,
+                timeout=timeout if timeout is not None else self.timeout,
             )
             response.raise_for_status()
             payload = response.json()

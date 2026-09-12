@@ -18,13 +18,21 @@ class Settings(BaseSettings):
 
     # SerpAPI normally responds in under 1s (sequential calls; concurrent
     # calls on this plan get severely throttled — see search_service.py).
-    # Kept tight so an occasional hung request doesn't dominate the stage.
-    search_timeout_seconds: int = 3
+    # NOTE: this was previously set to 3s to shave latency, but that caused
+    # a real outage in production — on Render's network, an occasional slow
+    # SerpAPI response caused all 3 sequential variant calls to time out,
+    # returning zero search results (and therefore zero entities) instead
+    # of just a slower response. 6s trades a little latency for not
+    # failing the whole query on a single slow leg.
+    search_timeout_seconds: int = 6
 
     # Scraping is bounded separately: arbitrary third-party pages can hang,
     # and we only need the first few good ones for extraction.
     scrape_timeout_seconds: int = 8
     max_scrape_candidates: int = 8
+
+    # How long a cached /discover result stays valid for a repeated query.
+    query_cache_ttl_seconds: int = 3600
 
     model_config = SettingsConfigDict(
         env_file=".env",

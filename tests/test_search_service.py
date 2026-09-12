@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+from app.models.entity_models import SearchResult
 from app.services.search_service import SearchService
 
 
@@ -38,3 +41,38 @@ class TestParseSerpapiResults:
 
     def test_empty_payload_returns_empty_list(self):
         assert self.service._parse_serpapi_results({}) == []
+
+
+class TestSearchMultiFallback:
+    def setup_method(self):
+        self.service = SearchService()
+
+    def test_retries_with_longer_timeout_when_all_variants_fail(self):
+        fallback_result = [SearchResult(title="Found it", url="https://a.com", snippet=None, rank=1)]
+
+        with patch.object(
+            self.service, "_generate_query_variants", return_value=["only query"],
+        ), patch.object(
+            self.service, "_search_serpapi", side_effect=[[], fallback_result],
+        ) as mock_search:
+            results = self.service.search_multi("only query")
+
+        assert results == fallback_result
+        # first call is the normal per-variant search, second is the
+        # longer-timeout fallback after everything came back empty
+        assert mock_search.call_count == 2
+        _, fallback_kwargs = mock_search.call_args_list[1]
+        assert fallback_kwargs["timeout"] == self.service.timeout * 3
+
+    def test_no_retry_needed_when_a_variant_succeeds(self):
+        result = [SearchResult(title="Found it", url="https://a.com", snippet=None, rank=1)]
+
+        with patch.object(
+            self.service, "_generate_query_variants", return_value=["only query"],
+        ), patch.object(
+            self.service, "_search_serpapi", return_value=result,
+        ) as mock_search:
+            results = self.service.search_multi("only query")
+
+        assert len(results) == 1
+        assert mock_search.call_count == 1
